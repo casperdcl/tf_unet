@@ -26,6 +26,7 @@ from collections import OrderedDict
 import logging
 
 import tensorflow as tf
+from tqdm.autonotebook import tqdm  # autodetect notebook/console
 
 from tf_unet import util
 from tf_unet.layers import (weight_variable, weight_variable_devonc, bias_variable, 
@@ -48,11 +49,12 @@ def create_conv_net(x, keep_prob, channels, n_class, layers=3, features_root=16,
     :param pool_size: size of the max pooling operation
     :param summaries: Flag if summaries should be created
     """
-    
-    logging.info("Layers {layers}, features {features}, filter size {filter_size}x{filter_size}, pool size: {pool_size}x{pool_size}".format(layers=layers,
-                                                                                                           features=features_root,
-                                                                                                           filter_size=filter_size,
-                                                                                                           pool_size=pool_size))
+
+    logging.info(("Layers {layers}, features {features}"
+                  ", filter size {filter_size}x{filter_size}"
+                  ", pool size: {pool_size}x{pool_size}").format(
+        layers=layers, features=features_root, filter_size=filter_size,
+        pool_size=pool_size))
     # Placeholder for the input image
     nx = tf.shape(x)[1]
     ny = tf.shape(x)[2]
@@ -412,31 +414,34 @@ class Trainer(object):
             logging.info("Start optimization")
             
             avg_gradients = None
-            for epoch in range(epochs):
-                total_loss = 0
-                for step in range((epoch*training_iters), ((epoch+1)*training_iters)):
-                    batch_x, batch_y = data_provider(self.batch_size)
-                     
-                    # Run optimization op (backprop)
-                    _, loss, lr, gradients = sess.run((self.optimizer, self.net.cost, self.learning_rate_node, self.net.gradients_node), 
-                                                      feed_dict={self.net.x: batch_x,
-                                                                 self.net.y: util.crop_to_shape(batch_y, pred_shape),
-                                                                 self.net.keep_prob: dropout})
+            with tqdm(range(epochs), unit="epoch") as t:
+                for epoch in t:
+                    total_loss = 0
+                    with tqdm(range((epoch*training_iters), ((epoch+1)*training_iters)),
+                              unit="minibatch", leave=False) as tBatch:
+                        for step in tBatch:
+                            batch_x, batch_y = data_provider(self.batch_size)
 
-                    if self.net.summaries and self.norm_grads:
-                        avg_gradients = _update_avg_gradients(avg_gradients, gradients, step)
-                        norm_gradients = [np.linalg.norm(gradient) for gradient in avg_gradients]
-                        self.norm_gradients_node.assign(norm_gradients).eval()
-                    
-                    if step % display_step == 0:
-                        self.output_minibatch_stats(sess, summary_writer, step, batch_x, util.crop_to_shape(batch_y, pred_shape))
-                        
-                    total_loss += loss
+                            # Run optimization op (backprop)
+                            _, loss, lr, gradients = sess.run((self.optimizer, self.net.cost, self.learning_rate_node, self.net.gradients_node),
+                                                              feed_dict={self.net.x: batch_x,
+                                                                         self.net.y: util.crop_to_shape(batch_y, pred_shape),
+                                                                         self.net.keep_prob: dropout})
 
-                self.output_epoch_stats(epoch, total_loss, training_iters, lr)
-                self.store_prediction(sess, test_x, test_y, "epoch_%s"%epoch)
-                    
-                save_path = self.net.save(sess, save_path)
+                            if self.net.summaries and self.norm_grads:
+                                avg_gradients = _update_avg_gradients(avg_gradients, gradients, step)
+                                norm_gradients = [np.linalg.norm(gradient) for gradient in avg_gradients]
+                                self.norm_gradients_node.assign(norm_gradients).eval()
+
+                            self.output_minibatch_stats(tBatch,
+                                sess, summary_writer, step, batch_x,
+                                util.crop_to_shape(batch_y, pred_shape))
+
+                            total_loss += loss
+                    t.set_postfix(loss_avg=total_loss/training_iters, rate_learn=lr, refresh=True)
+                    self.store_prediction(sess, test_x, test_y, "epoch_%s"%epoch)
+
+                    save_path = self.net.save(sess, save_path)
             logging.info("Optimization Finished!")
             
             return save_path
@@ -460,11 +465,8 @@ class Trainer(object):
         util.save_image(img, "%s/%s.jpg"%(self.prediction_path, name))
         
         return pred_shape
-    
-    def output_epoch_stats(self, epoch, total_loss, training_iters, lr):
-        logging.info("Epoch {:}, Average loss: {:.4f}, learning rate: {:.4f}".format(epoch, (total_loss / training_iters), lr))
-    
-    def output_minibatch_stats(self, sess, summary_writer, step, batch_x, batch_y):
+
+    def output_minibatch_stats(self, tqdm_bar, sess, summary_writer, step, batch_x, batch_y):
         # Calculate batch loss and accuracy
         summary_str, loss, acc, predictions = sess.run([self.summary_op, 
                                                             self.net.cost, 
@@ -475,10 +477,8 @@ class Trainer(object):
                                                                       self.net.keep_prob: 1.})
         summary_writer.add_summary(summary_str, step)
         summary_writer.flush()
-        logging.info("Iter {:}, Minibatch Loss= {:.4f}, Training Accuracy= {:.4f}, Minibatch error= {:.1f}%".format(step,
-                                                                                                            loss,
-                                                                                                            acc,
-                                                                                                            error_rate(predictions, batch_y)))
+        tqdm_bar.n = step
+        tqdm_bar.set_postfix(Loss=loss, Accuracy=acc, Err=error_rate(predictions, batch_y))
 
 def _update_avg_gradients(avg_gradients, gradients, step):
     if avg_gradients is None:
